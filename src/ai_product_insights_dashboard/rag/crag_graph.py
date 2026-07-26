@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -31,6 +32,27 @@ except ImportError:
 DEFAULT_TOP_K = 5
 MAX_ITERATIONS = 2
 GENERATION_MODEL = "llama-3.3-70b-versatile"
+
+PRODUCT_TITLES_PATH = Path("data/processed/product_titles.json")
+_product_titles: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def _get_product_titles() -> Dict[str, Dict[str, str]]:
+    """Lazy-loaded parent_asin -> {title, store} lookup.
+
+    raw_review_Software has no product-name field, only asin/parent_asin
+    (PRD §4). Built once via `scripts/build_product_titles.py`, which joins
+    raw_meta_Software's `title` onto the parent_asins actually present in
+    this corpus, so the sole 256MB metadata file itself never needs to ship.
+    """
+    global _product_titles
+    if _product_titles is None:
+        try:
+            _product_titles = json.loads(PRODUCT_TITLES_PATH.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            logger.warning(f"{PRODUCT_TITLES_PATH} not found; citations will fall back to ASIN")
+            _product_titles = {}
+    return _product_titles
 
 
 class CRAGState(TypedDict, total=False):
@@ -132,36 +154,45 @@ def _fallback_answer(question: str, chunks: List[Dict[str, Any]]) -> tuple[str, 
 
 
 def _tag_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Tag chunks with a short citable label plus their asin/review-title.
+    """Tag chunks with a short citable label plus a resolved product name.
 
-    The dataset has no product-name field (only `asin`), and this corpus
-    spans many distinct software products under one "Software" category —
-    a raw content-hash chunk_id tells a PM neither. This is what both the
-    graph path and the streaming path cite against instead.
+    The dataset has no product-name field on the review itself (only
+    `asin`/`parent_asin`), and this corpus spans many distinct software
+    products under one "Software" category — a raw content-hash chunk_id,
+    or the ASIN alone, tells a PM neither what it is nor whether two
+    citations are even the same product. `_get_product_titles()` resolves
+    `parent_asin` to the real product title via a one-time join against
+    raw_meta_Software (see `scripts/build_product_titles.py`).
     """
+    product_titles = _get_product_titles()
     tagged = []
     for i, c in enumerate(chunks, start=1):
         meta = c.get("metadata", {}) or {}
+        parent_asin = meta.get("parent_asin")
+        product_info = product_titles.get(parent_asin, {})
         tagged.append({
             "tag": f"R{i}",
             "chunk": c,
             "asin": meta.get("asin"),
-            "title": meta.get("title") or "(untitled review)",
+            "parent_asin": parent_asin,
+            "product": product_info.get("title") or parent_asin or "unknown product",
+            "store": product_info.get("store") or "",
+            "review_title": meta.get("title") or "(untitled review)",
             "rating": meta.get("rating"),
         })
     return tagged
 
 
 def _build_generation_prompt(question: str, tagged: List[Dict[str, Any]]) -> str:
-    distinct_asins = {t["asin"] for t in tagged if t["asin"]}
+    distinct_products = {t["product"] for t in tagged}
     context = "\n\n".join(
-        f'[{t["tag"]}] product ASIN {t["asin"]}, review titled "{t["title"]}" (rating {t["rating"]}): {t["chunk"].get("text", "")}'
+        f'[{t["tag"]}] product "{t["product"]}", review titled "{t["review_title"]}" (rating {t["rating"]}): {t["chunk"].get("text", "")}'
         for t in tagged
     )
     multi_product_note = (
-        "\n\nThese excerpts span more than one distinct product (different ASINs) — "
-        "say so explicitly rather than implying they're all about the same app."
-        if len(distinct_asins) > 1 else ""
+        "\n\nThese excerpts are about different products — "
+        "say so explicitly, naming which product each point applies to, rather than implying they're all about the same app."
+        if len(distinct_products) > 1 else ""
     )
     return f"""You are a product analyst briefing a PM. Answer the question using the customer review excerpts below, citing the bracketed tag (e.g. [R1]) of every review you rely on — never invent a citation that isn't listed.{multi_product_note}
 
@@ -174,7 +205,7 @@ Reviews:
 
 Question: {question}
 
-Answer (2-4 sentences, with [R#] citations, giving your observation/inference plainly):"""
+Answer (2-4 sentences, with [R#] citations, naming the product(s) involved, giving your observation/inference plainly):"""
 
 
 def _build_sources(question: str, tagged: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -183,8 +214,10 @@ def _build_sources(question: str, tagged: List[Dict[str, Any]]) -> List[Dict[str
         {
             "tag": t["tag"],
             "review_id": (t["chunk"].get("metadata", {}) or {}).get("review_id") or t["chunk"].get("review_id"),
+            "product": t["product"],
+            "store": t["store"],
             "asin": t["asin"],
-            "title": t["title"],
+            "title": t["review_title"],
             "rating": t["rating"],
             "text": (t["chunk"].get("text") or "")[:200],
             "relevance": grader.get_relevance_score(question, t["chunk"]),
