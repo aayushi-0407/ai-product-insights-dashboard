@@ -25,3 +25,6 @@ data/*.error.log
 .idea/
 .DS_Store
 Thumbs.db
+
+# Personal notes — not for the public repo
+INTERVIEW_PREP_HLD.md

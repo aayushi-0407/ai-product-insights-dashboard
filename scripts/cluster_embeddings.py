@@ -273,23 +273,37 @@ def print_cluster_summary(labels: np.ndarray, label_names: Dict[int, str]):
 
 def main():
     """Main clustering pipeline."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Cluster and label review embeddings")
+    parser.add_argument(
+        "--min-cluster-size",
+        type=int,
+        default=5,
+        help="HDBSCAN min_cluster_size. Larger corpora need a larger value to avoid "
+             "fragmenting into hundreds of near-duplicate micro-clusters (e.g. 150-300 "
+             "for a 20k-review single-product corpus vs. the 5 default tuned for ~1k).",
+    )
+    parser.add_argument("--min-samples", type=int, default=3, help="HDBSCAN min_samples")
+    args = parser.parse_args()
+
     print("\n" + "="*60)
     print("PHASE 2A: CLUSTERING & LABELING")
     print("="*60 + "\n")
-    
+
     # Paths
     processed_chunks_path = Path("data/processed/review_chunks.jsonl")
     output_path = Path("data/processed/clustered_chunks.jsonl")
-    
+
     if not processed_chunks_path.exists():
         logger.error(f"❌ {processed_chunks_path} not found. Run ingest_reviews.py first.")
         return
-    
+
     # Load embeddings
     chunk_ids, embeddings = load_embeddings_from_jsonl(str(processed_chunks_path))
-    
+
     # Cluster
-    labels, n_clusters = cluster_embeddings(embeddings, min_cluster_size=5)
+    labels, n_clusters = cluster_embeddings(embeddings, min_cluster_size=args.min_cluster_size, min_samples=args.min_samples)
     
     # Label clusters (with or without LLM)
     label_names = label_clusters_with_groq(chunk_ids, embeddings, labels, str(processed_chunks_path), n_clusters)

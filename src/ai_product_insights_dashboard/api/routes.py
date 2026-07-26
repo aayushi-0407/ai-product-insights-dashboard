@@ -40,6 +40,22 @@ class ClusterMetrics(BaseModel):
     growth_rate: float = 0.0
     recent_count: int = 0
     sentiment: str = "neutral"
+    pain_index: int = 0
+    emerging: bool = False
+    sparkline: List[int] = []
+
+
+class ThemeReview(BaseModel):
+    review_id: Optional[str]
+    text: str
+    rating: Optional[float]
+    helpful_vote: int
+    verified_purchase: bool
+    product: str
+
+
+class ThemeDetail(ClusterMetrics):
+    top_reviews: List[ThemeReview]
 
 
 class ComplaintItem(BaseModel):
@@ -71,6 +87,52 @@ class Alert(BaseModel):
 
 
 # ===== SHARED AGGREGATION LAYER =====
+
+def _pain_index(count: int, avg_rating: float, negative_percentage: float) -> int:
+    """volume x bad-outcome severity — same spirit as a support-ticket "pain"
+    score, adapted to review fields: there's no CSAT/churn/SLA-breach here,
+    so severity is negative-review share plus how far avg_rating sits below
+    a neutral 3.5/5, and pain scales with how many reviews carry that
+    severity. Weights/scale are tunable, not derived from anything external.
+    """
+    severity = (negative_percentage / 100) * 1.5 + max(0.0, (3.5 - avg_rating) / 3.5)
+    return round(count * severity * 20)
+
+
+def _is_emerging(growth_rate: float, recent_count: int) -> bool:
+    return growth_rate >= 0.5 and recent_count >= 3
+
+
+def _bucket_sparkline(dates: List[str], buckets: int = 8) -> List[int]:
+    """Chronological volume shape for a theme, independent of calendar time.
+
+    This corpus is a historical bulk load spread across two decades with
+    very uneven density (see PRD §5) — fixed calendar buckets (e.g. one per
+    week) would leave most buckets at zero for any theme with sparse dates.
+    Splitting each theme's own reviews into N equal chronological groups
+    always produces a populated shape, at the cost of the x-axis not being
+    literal wall-clock time.
+    """
+    valid = sorted(d for d in dates if d)
+    if not valid:
+        return [0] * buckets
+    n = len(valid)
+    bucket_size = max(1, -(-n // buckets))  # ceil division
+    counts = [len(valid[i:i + bucket_size]) for i in range(0, n, bucket_size)]
+    counts += [0] * (buckets - len(counts))
+    return counts[:buckets]
+
+
+def _enrich_clusters(clusters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Attach pain_index/emerging/sparkline; used by every endpoint so the
+    ranking is consistent whether the caller hit /trends, /themes, or the
+    dashboard summary."""
+    for c in clusters:
+        c["pain_index"] = _pain_index(c["count"], c["avg_rating"], c["negative_percentage"])
+        c["emerging"] = _is_emerging(c["growth_rate"], c["recent_count"])
+        c["sparkline"] = _bucket_sparkline(c.pop("dates", []))
+    return clusters
+
 
 def _parse_window_days(window: str) -> int:
     """Parse a PRD-style window string like '30d' into a day count."""
@@ -191,16 +253,19 @@ def _jsonl_cluster_metrics(window_days: int) -> Dict[str, Any]:
             continue
 
         current = prior = 0
-        if anchor_dt:
-            for r in _unique_reviews(group['chunks']):
-                ts = r.get('metadata', {}).get('timestamp')
-                if not isinstance(ts, (int, float)) or ts <= 0:
-                    continue
-                dt = datetime.fromtimestamp(ts / 1000)
-                if dt > current_start:
-                    current += 1
-                elif dt > prior_start:
-                    prior += 1
+        dates = []
+        for r in _unique_reviews(group['chunks']):
+            ts = r.get('metadata', {}).get('timestamp')
+            if not isinstance(ts, (int, float)) or ts <= 0:
+                continue
+            dt = datetime.fromtimestamp(ts / 1000)
+            dates.append(dt.date().isoformat())
+            if not anchor_dt:
+                continue
+            if dt > current_start:
+                current += 1
+            elif dt > prior_start:
+                prior += 1
 
         growth_rate = (current / prior - 1) if prior else (1.0 if current else 0.0)
         clusters.append({
@@ -210,6 +275,7 @@ def _jsonl_cluster_metrics(window_days: int) -> Dict[str, Any]:
             'growth_rate': round(growth_rate, 3),
             'recent_count': current,
             'sentiment': 'negative' if metrics['avg_rating'] <= 3 else 'positive',
+            'dates': dates,
         })
 
     all_ratings = [r.get('metadata', {}).get('rating', 3) for r in reviews]
@@ -236,12 +302,77 @@ def get_cluster_metrics(window_days: int = 30) -> Dict[str, Any]:
             from ..storage.postgres_store import get_dashboard_metrics
             data = get_dashboard_metrics(window_days)
             if data["total_reviews"] > 0:
+                data["clusters"] = _enrich_clusters(data["clusters"])
                 return data
             logger.info("Postgres has no reviews yet; falling back to JSONL")
         except Exception as e:
             logger.warning(f"Postgres aggregation failed ({e}); falling back to JSONL")
 
-    return _jsonl_cluster_metrics(window_days)
+    data = _jsonl_cluster_metrics(window_days)
+    data["clusters"] = _enrich_clusters(data["clusters"])
+    return data
+
+
+_product_titles_cache: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def _product_titles() -> Dict[str, Dict[str, str]]:
+    """Same parent_asin -> {title, store} lookup used for /ask citations
+    (see scripts/build_product_titles.py) — reused here so theme detail
+    reviews show a real product name instead of a bare ASIN."""
+    global _product_titles_cache
+    if _product_titles_cache is None:
+        try:
+            _product_titles_cache = json.loads(
+                Path("data/processed/product_titles.json").read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            _product_titles_cache = {}
+    return _product_titles_cache
+
+
+def _resolve_product(parent_asin: Optional[str], asin: Optional[str]) -> str:
+    info = _product_titles().get(parent_asin, {})
+    return info.get("title") or parent_asin or asin or "unknown product"
+
+
+def _theme_reviews(cluster_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    """Top complaint excerpts for a theme's detail view: worst rating first."""
+    if os.getenv("DATABASE_URL"):
+        try:
+            from ..storage.postgres_store import get_cluster_reviews
+            rows = get_cluster_reviews(cluster_id, limit=limit)
+            if rows:
+                return [
+                    {
+                        "review_id": r.get("review_id"),
+                        "text": (r.get("review_text") or "")[:400],
+                        "rating": r.get("rating"),
+                        "helpful_vote": r.get("helpful_vote") or 0,
+                        "verified_purchase": bool(r.get("verified_purchase")),
+                        "product": _resolve_product(r.get("parent_asin"), r.get("asin")),
+                    }
+                    for r in rows
+                ]
+        except Exception as e:
+            logger.warning(f"Postgres cluster reviews failed ({e}); falling back to JSONL")
+
+    chunks = load_processed_chunks()
+    cluster_chunks = _unique_reviews([c for c in chunks if c.get('cluster_id') == cluster_id])
+    cluster_chunks.sort(key=lambda c: (c.get('metadata', {}).get('rating', 3), -(c.get('metadata', {}).get('helpful_vote', 0) or 0)))
+
+    reviews = []
+    for c in cluster_chunks[:limit]:
+        meta = c.get('metadata', {}) or {}
+        reviews.append({
+            "review_id": c.get("review_id"),
+            "text": (c.get("text") or "")[:400],
+            "rating": meta.get("rating"),
+            "helpful_vote": meta.get("helpful_vote") or 0,
+            "verified_purchase": bool(meta.get("verified_purchase")),
+            "product": _resolve_product(meta.get("parent_asin"), meta.get("asin")),
+        })
+    return reviews
 
 
 # ===== ENDPOINTS =====
@@ -266,6 +397,41 @@ async def get_trends(
     clusters.sort(key=lambda c: c[sort_key], reverse=True)
 
     return [ClusterMetrics(**c) for c in clusters[:limit]]
+
+
+@router.get("/themes", response_model=List[ClusterMetrics])
+async def get_themes(
+    window: str = Query("30d", description="Growth window, e.g. '30d' or '90d'"),
+    sort: str = Query("pain", pattern="^(pain|count|growth)$"),
+) -> List[ClusterMetrics]:
+    """
+    All discovered themes (HDBSCAN clusters), ranked by pain_index by default.
+    Excludes the unclustered "noise" bucket — a theme is by definition a
+    coherent cluster; noise isn't one.
+    """
+    data = get_cluster_metrics(_parse_window_days(window))
+    clusters = [c for c in data["clusters"] if c["cluster_id"] is not None]
+    if not clusters:
+        raise HTTPException(status_code=404, detail="No clustered themes available yet")
+
+    sort_key = {"pain": "pain_index", "count": "count", "growth": "growth_rate"}[sort]
+    clusters.sort(key=lambda c: c[sort_key], reverse=True)
+    return [ClusterMetrics(**c) for c in clusters]
+
+
+@router.get("/themes/{cluster_id}", response_model=ThemeDetail)
+async def get_theme_detail(
+    cluster_id: int,
+    window: str = Query("30d", description="Growth window, e.g. '30d' or '90d'"),
+) -> ThemeDetail:
+    """A single theme's full scorecard plus its top complaint excerpts."""
+    data = get_cluster_metrics(_parse_window_days(window))
+    match = next((c for c in data["clusters"] if c["cluster_id"] == cluster_id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail="Theme not found")
+
+    reviews = _theme_reviews(cluster_id, limit=10)
+    return ThemeDetail(**match, top_reviews=[ThemeReview(**r) for r in reviews])
 
 
 @router.get("/complaints/top", response_model=List[ComplaintItem])

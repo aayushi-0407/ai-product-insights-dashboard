@@ -126,54 +126,76 @@ def save_review_document(review: dict[str, Any], review_id: str | None = None) -
     return resolved_id
 
 
-def save_documents(documents: list[dict[str, Any]]) -> int:
-    """Bulk save chunk/review records to PostgreSQL, idempotent on review_id."""
+def save_documents(documents: list[dict[str, Any]], batch_size: int = 1000) -> int:
+    """Bulk save chunk/review records to PostgreSQL, idempotent on review_id.
+
+    Batches via SQLAlchemy's executemany-style multi-params execute instead
+    of one round-trip per row — at 1k reviews the per-row loop was fine, but
+    it turned a 20k-review load into ~20,000 sequential network round-trips
+    to a remote (Neon) database, which is the difference between seconds
+    and many minutes.
+    """
     from sqlalchemy import text
 
     engine = _get_db_connection()
-    count = 0
+
+    rows = []
+    for doc in documents:
+        metadata = doc.get("metadata", {}) or {}
+        review_id = str(doc.get("review_id") or doc.get("id"))
+        fields = _derive_fields(metadata)
+        rows.append({"review_id": review_id, "review_text": str(doc.get("text", "")), **fields})
+
+    if not rows:
+        return 0
+
+    stmt = text("""
+        INSERT INTO reviews (
+            review_id, asin, parent_asin, review_text, rating,
+            review_date, verified_purchase, helpful_vote,
+            user_tier, sentiment
+        ) VALUES (
+            :review_id, :asin, :parent_asin, :review_text, :rating,
+            :review_date, :verified_purchase, :helpful_vote,
+            :user_tier, :sentiment
+        )
+        ON CONFLICT (review_id) DO NOTHING
+    """)
 
     with engine.begin() as conn:
-        for doc in documents:
-            metadata = doc.get("metadata", {}) or {}
-            review_id = str(doc.get("review_id") or doc.get("id"))
-            fields = _derive_fields(metadata)
-            review_text = doc.get("text", "")
+        for start in range(0, len(rows), batch_size):
+            conn.execute(stmt, rows[start:start + batch_size])
 
-            result = conn.execute(text("""
-                INSERT INTO reviews (
-                    review_id, asin, parent_asin, review_text, rating,
-                    review_date, verified_purchase, helpful_vote,
-                    user_tier, sentiment
-                ) VALUES (
-                    :review_id, :asin, :parent_asin, :review_text, :rating,
-                    :review_date, :verified_purchase, :helpful_vote,
-                    :user_tier, :sentiment
-                )
-                ON CONFLICT (review_id) DO NOTHING
-            """), {"review_id": review_id, "review_text": str(review_text), **fields})
-            count += result.rowcount
-
-    return count
+    # psycopg2 doesn't reliably sum rowcount across a batched executemany, so
+    # this is "rows attempted" rather than "rows actually inserted" (some may
+    # have hit ON CONFLICT DO NOTHING) — fine for the progress count this feeds.
+    return len(rows)
 
 
-def update_cluster_assignments(assignments: dict[str, tuple[int | None, str]]) -> int:
+def update_cluster_assignments(assignments: dict[str, tuple[int | None, str]], batch_size: int = 1000) -> int:
     """Write cluster_id/cluster_label back onto reviews, keyed by review_id."""
     from sqlalchemy import text
 
     engine = _get_db_connection()
-    count = 0
+
+    rows = [
+        {"review_id": review_id, "cluster_id": cluster_id, "cluster_label": cluster_label}
+        for review_id, (cluster_id, cluster_label) in assignments.items()
+    ]
+    if not rows:
+        return 0
+
+    stmt = text("""
+        UPDATE reviews
+        SET cluster_id = :cluster_id, cluster_label = :cluster_label, updated_at = CURRENT_TIMESTAMP
+        WHERE review_id = :review_id
+    """)
 
     with engine.begin() as conn:
-        for review_id, (cluster_id, cluster_label) in assignments.items():
-            result = conn.execute(text("""
-                UPDATE reviews
-                SET cluster_id = :cluster_id, cluster_label = :cluster_label, updated_at = CURRENT_TIMESTAMP
-                WHERE review_id = :review_id
-            """), {"cluster_id": cluster_id, "cluster_label": cluster_label, "review_id": review_id})
-            count += result.rowcount
+        for start in range(0, len(rows), batch_size):
+            conn.execute(stmt, rows[start:start + batch_size])
 
-    return count
+    return len(rows)
 
 
 def get_dashboard_metrics(window_days: int = 30) -> dict[str, Any]:
@@ -227,6 +249,17 @@ def get_dashboard_metrics(window_days: int = 30) -> dict[str, Any]:
             FROM reviews
         """)).mappings().one()
 
+        # For the sparkline: cheap to pull all (cluster_id, review_date) pairs
+        # in one shot at this corpus size rather than a per-cluster query.
+        date_rows = conn.execute(text("""
+            SELECT cluster_id, review_date FROM reviews WHERE cluster_id IS NOT NULL
+        """)).all()
+
+    dates_by_cluster: dict[Any, list[str]] = {}
+    for cid, review_date in date_rows:
+        if review_date is not None:
+            dates_by_cluster.setdefault(cid, []).append(review_date.isoformat())
+
     clusters = []
     for row in cluster_rows:
         cid = row["cluster_id"]
@@ -246,6 +279,7 @@ def get_dashboard_metrics(window_days: int = 30) -> dict[str, Any]:
             "growth_rate": round(growth_rate, 3),
             "recent_count": current,
             "sentiment": "negative" if avg_rating <= 3 else "positive",
+            "dates": dates_by_cluster.get(cid, []),
         })
 
     total = overall["total"] or 0
@@ -257,3 +291,22 @@ def get_dashboard_metrics(window_days: int = 30) -> dict[str, Any]:
         "window_days": window_days,
         "anchor_date": anchor.isoformat(),
     }
+
+
+def get_cluster_reviews(cluster_id: int, limit: int = 10) -> list[dict[str, Any]]:
+    """Representative "top complaints" for a theme: worst rating first, then
+    most-helpful-voted, so the most impactful negative reviews surface first.
+    """
+    from sqlalchemy import text
+
+    engine = _get_db_connection()
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT review_id, review_text, rating, helpful_vote, verified_purchase, asin, parent_asin
+            FROM reviews
+            WHERE cluster_id = :cluster_id
+            ORDER BY rating ASC, helpful_vote DESC
+            LIMIT :limit
+        """), {"cluster_id": cluster_id, "limit": limit}).mappings().all()
+
+    return [dict(row) for row in rows]

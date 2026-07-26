@@ -12,6 +12,10 @@ import truststore
 
 truststore.inject_into_ssl()
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -62,7 +66,14 @@ def main() -> None:
         "--limit",
         type=int,
         default=None,
-        help="Limit number of reviews to fetch (for testing)"
+        help="Limit number of reviews to fetch (for testing, or the corpus size when --parent-asin is set)"
+    )
+    parser.add_argument(
+        "--parent-asin",
+        default=None,
+        help="Fetch only this product's reviews (see scripts/find_top_product.py) — "
+             "a single-product corpus produces sharp, specific themes instead of "
+             "vague cross-product ones",
     )
     parser.add_argument(
         "--raw-output",
@@ -128,11 +139,14 @@ def main() -> None:
     # Fetch reviews
     print(f"Fetching reviews from {args.dataset}:{args.config_name}")
     print(f"  Limit: {args.limit or 'none'}")
+    if args.parent_asin:
+        print(f"  Filtering to single product: {args.parent_asin} (full file scan required)")
     reviews = fetch_reviews(
         args.dataset,
         config_name=args.config_name,
         split=args.split,
         limit=args.limit,
+        parent_asin=args.parent_asin,
     )
     print(f"✓ Fetched {len(reviews)} reviews")
 

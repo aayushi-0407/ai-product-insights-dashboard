@@ -93,12 +93,18 @@ def _upsert_chroma(
     if not ids:
         return
 
-    collection.upsert(
-        ids=ids,
-        embeddings=embeddings,
-        documents=documents,
-        metadatas=metadatas,
-    )
+    # Chroma rejects a single upsert call above ~5,461 records (its internal
+    # max batch size), which the original 800-product/1k-review corpus never
+    # hit but a single-product 20k-review corpus does.
+    batch_size = 4000
+    for start in range(0, len(ids), batch_size):
+        end = start + batch_size
+        collection.upsert(
+            ids=ids[start:end],
+            embeddings=embeddings[start:end],
+            documents=documents[start:end],
+            metadatas=metadatas[start:end],
+        )
 
 
 def _flatten_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
