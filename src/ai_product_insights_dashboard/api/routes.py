@@ -295,12 +295,14 @@ async def get_top_complaints(limit: int = Query(10, ge=1, le=50)) -> List[Compla
 
 
 @router.get("/dashboard/summary", response_model=DashboardSummary)
-async def get_dashboard_summary() -> DashboardSummary:
+async def get_dashboard_summary(
+    window: str = Query("30d", description="Growth window, e.g. '30d' or '90d'"),
+) -> DashboardSummary:
     """
     Get dashboard summary: total reviews, cluster breakdown, top issues.
-    **Returns**: Overall metrics + top 5 clusters + top 5 complaints
+    **Returns**: Overall metrics + top 5 clusters (with growth over `window`) + top 5 complaints
     """
-    data = get_cluster_metrics()
+    data = get_cluster_metrics(_parse_window_days(window))
     if not data["clusters"] and data["total_reviews"] == 0:
         raise HTTPException(status_code=404, detail="No processed data available")
 
