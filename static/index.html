@@ -84,7 +84,46 @@
     $('#panel-select').addEventListener('change',()=>{const val=$('#panel-select').value;document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===`panel-${val}`));});
     function sourceLabel(s){ if(typeof s !== 'object' || s === null) return esc(String(s)); const tag=s.tag?`${s.tag}: `:''; const title=s.title||'review'; const rating=s.rating!=null?` (${s.rating}★)`:''; const asin=s.asin?` · ASIN ${s.asin}`:''; return esc(`${tag}"${title}"${rating}${asin}`); }
     function appendMessage(text,user=false,sources=[],confidence){const d=document.createElement('div');d.className=`message ${user?'user':''}`; const evidence=sources.length?`<div class="source">Sources: ${sources.map(sourceLabel).join(' · ')}${confidence!==undefined?` · ${Math.round(confidence*100)}% confidence`:''}</div>`:'';d.innerHTML=`${user?'':'<div class="msg-avatar">✦</div>'}<div class="bubble">${esc(text)}${evidence}</div>`;$('#messages').append(d);$('#messages').scrollTop=$('#messages').scrollHeight;return d;}
-    $('#chat-form').addEventListener('submit',async e=>{e.preventDefault();const input=$('#chat-input'),q=input.value.trim();if(!q)return;appendMessage(q,true);input.value='';input.disabled=true;const waiting=appendMessage('Searching review evidence…');try{const r=await fetch(API+'/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});if(!r.ok)throw new Error('The assistant could not answer right now');const data=await r.json();waiting.remove();appendMessage(data.answer || 'I could not find a supported answer.',false,data.sources || [],data.confidence)}catch(err){waiting.remove();appendMessage(err.message,false)}finally{input.disabled=false;input.focus()}});
+    function appendBotBubble(){const d=document.createElement('div');d.className='message';d.innerHTML='<div class="msg-avatar">✦</div><div class="bubble"><span class="answer-text"></span></div>';$('#messages').append(d);$('#messages').scrollTop=$('#messages').scrollHeight;return d.querySelector('.bubble');}
+    function appendToken(bubble,text){bubble.querySelector('.answer-text').textContent+=text;$('#messages').scrollTop=$('#messages').scrollHeight;}
+    function finalizeBubble(bubble,sources=[],confidence){if(!sources.length)return;const src=document.createElement('div');src.className='source';src.innerHTML=`Sources: ${sources.map(sourceLabel).join(' · ')}${confidence!==undefined?` · ${Math.round(confidence*100)}% confidence`:''}`;bubble.appendChild(src);}
+    $('#chat-form').addEventListener('submit',async e=>{
+      e.preventDefault();
+      const input=$('#chat-input'),q=input.value.trim();
+      if(!q)return;
+      appendMessage(q,true);
+      input.value='';
+      input.disabled=true;
+      const bubble=appendBotBubble();
+      let sources=[],confidence,gotToken=false;
+      try{
+        const r=await fetch(API+'/ask/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});
+        if(!r.ok||!r.body)throw new Error('The assistant could not answer right now');
+        const reader=r.body.getReader(),decoder=new TextDecoder();
+        let buffer='';
+        while(true){
+          const {done,value}=await reader.read();
+          if(done)break;
+          buffer+=decoder.decode(value,{stream:true});
+          const lines=buffer.split('\n');
+          buffer=lines.pop();
+          for(const line of lines){
+            if(!line.trim())continue;
+            let evt; try{evt=JSON.parse(line);}catch{continue;}
+            if(evt.type==='sources'){sources=evt.sources||[];confidence=evt.confidence;}
+            else if(evt.type==='token'){appendToken(bubble,evt.text);gotToken=true;}
+            else if(evt.type==='error')throw new Error(evt.message||'The assistant could not answer right now');
+          }
+        }
+        if(!gotToken)appendToken(bubble,'I could not find a supported answer.');
+        finalizeBubble(bubble,sources,confidence);
+      }catch(err){
+        bubble.querySelector('.answer-text').textContent=err.message;
+      }finally{
+        input.disabled=false;
+        input.focus();
+      }
+    });
     document.querySelectorAll('.prompt').forEach(b=>b.addEventListener('click',()=>{$('#chat-input').value=b.textContent;setView('chat');$('#chat-input').focus()}));
     loadDashboard();
   </script>

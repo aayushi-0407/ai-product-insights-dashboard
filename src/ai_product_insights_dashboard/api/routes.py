@@ -14,6 +14,7 @@ so the demo still works without a database.
 
 import os
 from fastapi import APIRouter, Query, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
@@ -422,6 +423,22 @@ async def ask_question(request: QuestionRequest) -> QuestionResponse:
             "correction_reason": result.get("correction_reason"),
         }
     )
+
+
+@router.post("/ask/stream")
+async def ask_question_stream(request: QuestionRequest) -> StreamingResponse:
+    """
+    Same question-answering as /ask, but streams the answer as newline-delimited
+    JSON events (`{"type": "sources"|"token"|"error", ...}`) so the chat UI can
+    render tokens as they're generated instead of waiting for the full answer.
+
+    Trades the self-correction retry loop for immediacy — see `stream_answer`'s
+    docstring. Use /ask instead when the retry guarantee matters more than
+    latency (e.g. programmatic callers).
+    """
+    from ..rag.crag_graph import stream_answer
+
+    return StreamingResponse(stream_answer(request.query), media_type="application/x-ndjson")
 
 
 @router.post("/prd/generate", response_model=PRDResponse)
