@@ -45,6 +45,7 @@ class CRAGState(TypedDict, total=False):
     answer: str
     confidence: float
     sources: List[Dict[str, Any]]
+    citation_tags: List[str]
     is_valid: bool
     issues: str
     self_correction_applied: bool
@@ -133,17 +134,39 @@ def _node_generate(state: CRAGState) -> Dict[str, Any]:
     chunks = state.get("relevant_chunks", [])[:10]
     if not chunks:
         return {"answer": "I couldn't find specific information in the reviews to answer that question.",
-                 "confidence": 0.0, "sources": []}
+                 "confidence": 0.0, "sources": [], "citation_tags": []}
+
+    # The dataset has no product-name field (only `asin`), and this corpus
+    # spans many distinct software products under one "Software" category —
+    # a raw content-hash chunk_id tells a PM neither. Tag each chunk with a
+    # short, citable label and carry its asin/review-title through to the
+    # answer and the sources list so it's clear what's actually being cited.
+    tagged = []
+    for i, c in enumerate(chunks, start=1):
+        meta = c.get("metadata", {}) or {}
+        tagged.append({
+            "tag": f"R{i}",
+            "chunk": c,
+            "asin": meta.get("asin"),
+            "title": meta.get("title") or "(untitled review)",
+            "rating": meta.get("rating"),
+        })
+    distinct_asins = {t["asin"] for t in tagged if t["asin"]}
 
     groq_key = os.getenv("GROQ_API_KEY")
     if GROQ_AVAILABLE and groq_key:
         try:
             client = Groq(api_key=groq_key)
             context = "\n\n".join(
-                f"[{c.get('chunk_id')}] (rating {c.get('metadata', {}).get('rating', 'N/A')}): {c.get('text', '')}"
-                for c in chunks
+                f'[{t["tag"]}] product ASIN {t["asin"]}, review titled "{t["title"]}" (rating {t["rating"]}): {t["chunk"].get("text", "")}'
+                for t in tagged
             )
-            prompt = f"""You are a product analyst briefing a PM. Answer the question using the customer review excerpts below, citing the bracketed id of every review you rely on.
+            multi_product_note = (
+                "\n\nThese excerpts span more than one distinct product (different ASINs) — "
+                "say so explicitly rather than implying they're all about the same app."
+                if len(distinct_asins) > 1 else ""
+            )
+            prompt = f"""You are a product analyst briefing a PM. Answer the question using the customer review excerpts below, citing the bracketed tag (e.g. [R1]) of every review you rely on — never invent a citation that isn't listed.{multi_product_note}
 
 Some questions ask for a judgment call (e.g. "which issue should we prioritize", "what's trending") that the reviews don't state as a single explicit fact. Do NOT refuse those — reason over the evidence instead: which theme comes up most, seems most severe, or is mentioned most negatively, and give that as your read of it. Say plainly when you're inferring rather than quoting a stated fact (e.g. "based on frequency and severity, X looks like the strongest candidate"), but always give your best answer from what's there.
 
@@ -154,7 +177,7 @@ Reviews:
 
 Question: {state['question']}
 
-Answer (2-4 sentences, with [chunk_id] citations, giving your observation/inference plainly):"""
+Answer (2-4 sentences, with [R#] citations, giving your observation/inference plainly):"""
             response = client.chat.completions.create(
                 model=GENERATION_MODEL,
                 max_tokens=300,
@@ -171,14 +194,22 @@ Answer (2-4 sentences, with [chunk_id] citations, giving your observation/infere
     grader = RelevanceGrader(use_llm=False)
     sources = [
         {
-            "review_id": (c.get("metadata", {}) or {}).get("review_id") or c.get("review_id"),
-            "chunk_id": c.get("chunk_id"),
-            "text": (c.get("text") or "")[:200],
-            "relevance": grader.get_relevance_score(state["question"], c),
+            "tag": t["tag"],
+            "review_id": (t["chunk"].get("metadata", {}) or {}).get("review_id") or t["chunk"].get("review_id"),
+            "asin": t["asin"],
+            "title": t["title"],
+            "rating": t["rating"],
+            "text": (t["chunk"].get("text") or "")[:200],
+            "relevance": grader.get_relevance_score(state["question"], t["chunk"]),
         }
-        for c in chunks[:3]
+        for t in tagged
     ]
-    return {"answer": answer, "confidence": confidence, "sources": sources}
+    return {
+        "answer": answer,
+        "confidence": confidence,
+        "sources": sources,
+        "citation_tags": [t["tag"] for t in tagged],
+    }
 
 
 def _node_verify(state: CRAGState) -> Dict[str, Any]:
@@ -191,7 +222,8 @@ def _node_verify(state: CRAGState) -> Dict[str, Any]:
         issues.append("answer too short")
 
     if chunks:
-        cited = any((c.get("chunk_id") or "") in answer for c in chunks)
+        tags = state.get("citation_tags", [])
+        cited = any(tag in answer for tag in tags) if tags else any((c.get("chunk_id") or "") in answer for c in chunks)
         mentions_reviews = any(w in answer.lower() for w in ("review", "rating", "customer", "feedback"))
         if not cited and not mentions_reviews:
             issues.append("answer does not reference retrieved review content")
