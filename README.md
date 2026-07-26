@@ -1,8 +1,20 @@
+---
+title: AI Product Insights Dashboard
+emoji: 📊
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # AI Product Insights Dashboard
 
 A production-shaped RAG system that turns product review streams into actionable insights. Processes Amazon reviews with AI-powered clustering, trend detection, and conversational Q&A.
 
-**Status**: Phase 1 (data pipeline) ✅ | Phase 2 (clustering & analytics) — in progress | Phase 3 (RAG agents) — planned
+**Status**: Phase 1 (data pipeline) ✅ | Phase 2 (clustering & analytics) ✅ | Phase 3 (RAG agents, self-correcting CRAG, multi-agent orchestration) ✅
+
+**Synthetic field disclosure**: `user_tier` (premium/free) is bootstrapped from `rating` at ingestion, not real subscription data — the Amazon Reviews 2023 dataset has no price/tier field for the `raw_review_Software` split used here. See PRD §4 for the real-`price`-via-`raw_meta_Software` alternative left as future work.
 
 ---
 

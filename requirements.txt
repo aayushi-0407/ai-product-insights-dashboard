@@ -1,0 +1,20 @@
+# Runtime dependencies for the deployed API (serves pre-built data/, no live
+# Hugging Face dataset fetch or clustering job in the container). Ingestion
+# and clustering are run locally beforehand with the full dev environment
+# from pyproject.toml; see README.md "Regenerating the demo data".
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+pydantic==2.13.4
+python-dotenv==1.2.2
+truststore==0.10.4
+
+sqlalchemy==2.0.51
+psycopg2-binary==2.9.12
+
+groq==1.5.0
+langgraph==1.2.9
+
+chromadb==1.5.9
+sentence-transformers==5.6.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0

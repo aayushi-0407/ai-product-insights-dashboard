@@ -1,0 +1,15 @@
+.venv/
+.git/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+.agents/
+data/*.log
+data/*.error.log
+data/raw/sample_reviews.jsonl
+AI_Product_Insights_Dashboard_PRD.md
+SETUP.md
+SUMMARY.md
+TODO.md
