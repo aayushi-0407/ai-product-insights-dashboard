@@ -1,0 +1,27 @@
+# Secrets
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Data (large/generated; regenerate via scripts/ingest_reviews.py + scripts/cluster_embeddings.py)
+data/raw/*.jsonl
+data/processed/*.jsonl
+data/vector_db/
+data/*.log
+data/*.error.log
+
+# Keep folder structure and small fixtures
+!data/raw/sample_reviews.jsonl
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
