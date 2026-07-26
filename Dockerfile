@@ -33,4 +33,7 @@ RUN chmod -R 777 /app
 
 EXPOSE 7860
 
-CMD ["uvicorn", "ai_product_insights_dashboard.app:app", "--host", "0.0.0.0", "--port", "7860"]
+# Render (and HF Spaces) inject $PORT at runtime and require the container to
+# bind to it; 7860 is only the local/default fallback. Shell form so $PORT
+# expands.
+CMD uvicorn ai_product_insights_dashboard.app:app --host 0.0.0.0 --port ${PORT:-7860}
