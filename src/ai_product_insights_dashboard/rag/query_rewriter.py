@@ -61,7 +61,7 @@ Original query: {query}
 Alternative queries:"""
         
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             max_tokens=150,
             messages=[{"role": "user", "content": prompt}]
         )

@@ -52,36 +52,43 @@ class RelevanceGrader:
         return relevant, irrelevant
     
     def _grade_with_groq(self, query: str, chunks: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-        """Use Groq LLM to grade relevance."""
+        """Use Groq LLM to grade relevance.
+
+        Grades all chunks in a single call instead of one call per chunk —
+        with top_k=5 that was 5 sequential network round-trips just for
+        grading, the single largest contributor to /ask latency. A small,
+        fast model is enough for this (grading is closer to a classification
+        task than an open-ended one); the larger model is reserved for the
+        final answer generation, where quality actually matters most.
+        """
         try:
             client = Groq(api_key=self.groq_key)
-            relevant = []
-            irrelevant = []
-            
-            for chunk in chunks:
-                text = chunk.get('text', '')[:200]  # First 200 chars
-                
-                prompt = f"""Is this review chunk relevant to the question?
 
-Question: {query}
-Chunk: {text}
+            numbered = "\n\n".join(
+                f"[{i}] (rating {c.get('metadata', {}).get('rating', 'N/A')}): {c.get('text', '')[:200]}"
+                for i, c in enumerate(chunks)
+            )
+            prompt = f"""Question: {query}
 
-Answer YES or NO only."""
-                
-                completion = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    max_tokens=10,
-                    messages=[{"role": "user", "content": prompt}]
-                )
+Review chunks:
+{numbered}
 
-                response = completion.choices[0].message.content.strip().upper()
-                if response.startswith('YES'):
-                    relevant.append(chunk)
-                else:
-                    irrelevant.append(chunk)
-            
+Which chunks are relevant to answering the question? Reply with ONLY a JSON array of the chunk numbers, e.g. [0,2,3]. If none are relevant, reply []."""
+
+            completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                max_tokens=100,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            raw = completion.choices[0].message.content.strip()
+            raw = raw[raw.find("["):raw.rfind("]") + 1] if "[" in raw and "]" in raw else "[]"
+            relevant_indices = set(json.loads(raw))
+
+            relevant = [c for i, c in enumerate(chunks) if i in relevant_indices]
+            irrelevant = [c for i, c in enumerate(chunks) if i not in relevant_indices]
             return relevant, irrelevant
-        
+
         except Exception as e:
             logger.warning(f"LLM grading failed: {e}, using heuristics")
             return self._grade_with_heuristics(query, chunks)

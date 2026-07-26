@@ -79,6 +79,17 @@ async def startup_event():
     logger.info("📊 Analytics endpoints available at /api/v1/")
     logger.info("📖 API docs available at /docs")
 
+    # Load the embedding model and connect to Chroma now, during startup,
+    # instead of lazily on the first /ask request — otherwise whichever user
+    # sends the first chat message after a cold start pays a multi-second
+    # model-load tax that has nothing to do with their actual question.
+    try:
+        from .rag.retriever import get_retriever
+        get_retriever()
+        logger.info("✓ Retriever warmed up (embedding model + vector store)")
+    except Exception as e:
+        logger.warning(f"Retriever warmup failed, will lazy-load on first request: {e}")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
