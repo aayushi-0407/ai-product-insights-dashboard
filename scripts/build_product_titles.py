@@ -26,6 +26,11 @@ if str(SRC_ROOT) not in sys.path:
 
 
 def main() -> None:
+    # Windows terminals default to cp1252, which can't render arbitrary
+    # product titles (or the status symbols below).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
     from huggingface_hub import hf_hub_url
     import requests
 
