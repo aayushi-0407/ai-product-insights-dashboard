@@ -143,14 +143,18 @@ def _node_generate(state: CRAGState) -> Dict[str, Any]:
                 f"[{c.get('chunk_id')}] (rating {c.get('metadata', {}).get('rating', 'N/A')}): {c.get('text', '')}"
                 for c in chunks
             )
-            prompt = f"""Answer the question using ONLY the customer review excerpts below. Cite the bracketed id of every review you rely on. If the reviews don't support an answer, say so plainly instead of guessing.
+            prompt = f"""You are a product analyst briefing a PM. Answer the question using the customer review excerpts below, citing the bracketed id of every review you rely on.
+
+Some questions ask for a judgment call (e.g. "which issue should we prioritize", "what's trending") that the reviews don't state as a single explicit fact. Do NOT refuse those — reason over the evidence instead: which theme comes up most, seems most severe, or is mentioned most negatively, and give that as your read of it. Say plainly when you're inferring rather than quoting a stated fact (e.g. "based on frequency and severity, X looks like the strongest candidate"), but always give your best answer from what's there.
+
+Only say the evidence is insufficient if the excerpts are genuinely unrelated to the question — not merely because no review explicitly states the answer.
 
 Reviews:
 {context}
 
 Question: {state['question']}
 
-Answer (2-4 sentences, with [chunk_id] citations):"""
+Answer (2-4 sentences, with [chunk_id] citations, giving your observation/inference plainly):"""
             response = client.chat.completions.create(
                 model=GENERATION_MODEL,
                 max_tokens=300,
